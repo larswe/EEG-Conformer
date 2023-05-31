@@ -9,9 +9,6 @@ Couple CNN and Transformer in a concise manner with amazing results
 
 import argparse
 import os
-gpus = [0]
-os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
-os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(map(str, gpus))
 import numpy as np
 import math
 import glob
@@ -56,11 +53,6 @@ from einops.layers.torch import Rearrange, Reduce
 
 import matplotlib.pyplot as plt
 # from torch.utils.tensorboard import SummaryWriter
-from torch.backends import cudnn
-cudnn.benchmark = False
-cudnn.deterministic = True
-
-# writer = SummaryWriter('./TensorBoardX/')
 
 
 # Convolution module
@@ -175,34 +167,43 @@ class TransformerEncoder(nn.Sequential):
         super().__init__(*[TransformerEncoderBlock(emb_size) for _ in range(depth)])
 
 
-class ClassificationHead(nn.Sequential):
+class ClassificationHead(nn.Module):
     def __init__(self, emb_size, n_classes):
         super().__init__()
         
-        # global average pooling
         self.clshead = nn.Sequential(
             Reduce('b n e -> b e', reduction='mean'),
             nn.LayerNorm(emb_size),
             nn.Linear(emb_size, n_classes)
         )
-        self.fc = nn.Sequential(
-            nn.Linear(2440, 256),
-            nn.ELU(),
-            nn.Dropout(0.5),
-            nn.Linear(256, 32),
-            nn.ELU(),
-            nn.Dropout(0.3),
-            nn.Linear(32, 4)
-        )
+        
+        # The dimensions of the linear layers in this sequence will be determined later
+        self.fc = None 
 
     def forward(self, x):
         x = x.contiguous().view(x.size(0), -1)
+        
+        # If self.fc has not been defined yet, or if the input size has changed,
+        # define it now with the correct input size
+        if self.fc is None or self.fc[0].in_features != x.size(-1):
+            self.fc = nn.Sequential(
+                nn.Linear(x.size(-1), 256),
+                nn.ELU(),
+                nn.Dropout(0.5),
+                nn.Linear(256, 32),
+                nn.ELU(),
+                nn.Dropout(0.3),
+                nn.Linear(32, 2)
+            )
+            self.fc = self.fc.to(x.device)  # Make sure self.fc is on the right device
+            
         out = self.fc(x)
         return x, out
 
 
+
 class Conformer(nn.Sequential):
-    def __init__(self, emb_size=40, depth=6, n_classes=4, **kwargs):
+    def __init__(self, emb_size=40, depth=6, n_classes=2, **kwargs):
         super().__init__(
 
             PatchEmbedding(emb_size),
@@ -212,11 +213,12 @@ class Conformer(nn.Sequential):
 
 
 class ExP():
-    def __init__(self, nsub):
+    def __init__(self, nsub, total_data, test_tmp):
         super(ExP, self).__init__()
+        self.device = torch.device('cpu')
         self.batch_size = 72
         self.n_epochs = 2000
-        self.c_dim = 4
+        self.c_dim = 2
         self.lr = 0.0002
         self.b1 = 0.5
         self.b2 = 0.999
@@ -224,83 +226,114 @@ class ExP():
         self.nSub = nsub
 
         self.start_epoch = 0
-        self.root = '/Data/strict_TE/'
+        self.root = '../data/'
 
         self.log_write = open("./results/log_subject%d.txt" % self.nSub, "w")
 
 
-        self.Tensor = torch.cuda.FloatTensor
-        self.LongTensor = torch.cuda.LongTensor
+        self.Tensor = torch.FloatTensor
+        self.LongTensor = torch.LongTensor
 
-        self.criterion_l1 = torch.nn.L1Loss().cuda()
-        self.criterion_l2 = torch.nn.MSELoss().cuda()
-        self.criterion_cls = torch.nn.CrossEntropyLoss().cuda()
+        self.criterion_l1 = torch.nn.L1Loss().to(self.device)
+        self.criterion_l2 = torch.nn.MSELoss().to(self.device)
+        self.criterion_cls = torch.nn.CrossEntropyLoss()
 
-        self.model = Conformer().cuda()
-        self.model = nn.DataParallel(self.model, device_ids=[i for i in range(len(gpus))])
-        self.model = self.model.cuda()
+        self.model = Conformer().to(self.device)
+        self.model = self.model.to(self.device)
         # summary(self.model, (1, 22, 1000))
+
+        self.total_data = total_data
+        self.test_tmp = test_tmp
 
 
     # Segmentation and Reconstruction (S&R) data augmentation
     def interaug(self, timg, label):  
         aug_data = []
         aug_label = []
-        for cls4aug in range(4):
+        for cls4aug in range(-1, 1):
             cls_idx = np.where(label == cls4aug + 1)
             tmp_data = timg[cls_idx]
             tmp_label = label[cls_idx]
+            print(f"Shape of tmp_data: {tmp_data.shape}")
+            print(f"Shape of tmp_label: {tmp_label.shape}")
 
-            tmp_aug_data = np.zeros((int(self.batch_size / 4), 1, 22, 1000))
-            for ri in range(int(self.batch_size / 4)):
+            tmp_aug_data = np.zeros((int(self.batch_size / 2), 1, 64, 256))
+            for ri in range(int(self.batch_size / 2)):
                 for rj in range(8):
+                    if (tmp_data.shape[0] == 0):
+                        print("tmp_data.shape[0] == 0")
+                        break
                     rand_idx = np.random.randint(0, tmp_data.shape[0], 8)
-                    tmp_aug_data[ri, :, :, rj * 125:(rj + 1) * 125] = tmp_data[rand_idx[rj], :, :,
-                                                                      rj * 125:(rj + 1) * 125]
+                    lhs = tmp_aug_data[ri, :, :, rj * 32:(rj + 1) * 32]
+                    rhs = tmp_data[rand_idx[rj], :, :, rj * 32:(rj + 1) * 32]
+                    # print(f"Shape of lhs: {lhs.shape}")
+                    # print(f"Shape of rhs: {rhs.shape}")
+                    tmp_aug_data[ri, :, :, rj * 32:(rj + 1) * 32] = tmp_data[rand_idx[rj], :, :,
+                                                                    rj * 32:(rj + 1) * 32]
 
             aug_data.append(tmp_aug_data)
-            aug_label.append(tmp_label[:int(self.batch_size / 4)])
+            aug_label.append(tmp_label[:int(self.batch_size / 2)])
+            appended = tmp_label[:int(self.batch_size / 2)]
+            print("Appended: ", appended)
+            print("Shapes on iteration: ", cls4aug)
+            print(f"Shape of aug_data: {np.array(aug_data).shape}")
+            print(f"Len of aug_label: {np.concatenate(aug_label).shape}")
+        # Print shapes one last time
+        print("Print shapes one last time")
+        print(f"Shape of aug_data: {np.array(aug_data).shape}")
+        print(f"Len of aug_label: {len(aug_label)}")
+        for label in aug_label:
+            print(f"Label: {label}")
+        print(aug_label)
         aug_data = np.concatenate(aug_data)
         aug_label = np.concatenate(aug_label)
         aug_shuffle = np.random.permutation(len(aug_data))
+        print(f"Shape of aug_data: {aug_data.shape}")
+        print(f"Len of aug_label: {len(aug_label)}")
+        print(f"Shape of aug_shuffle: {aug_shuffle.shape}")
         aug_data = aug_data[aug_shuffle, :, :]
         aug_label = aug_label[aug_shuffle]
 
-        aug_data = torch.from_numpy(aug_data).cuda()
+        aug_data = torch.from_numpy(aug_data).to(self.device)
         aug_data = aug_data.float()
-        aug_label = torch.from_numpy(aug_label-1).cuda()
+        aug_label = torch.from_numpy(aug_label).to(self.device)
         aug_label = aug_label.long()
+        print("aug_label: ", aug_label)
         return aug_data, aug_label
 
     def get_source_data(self):
-
         # train data
-        self.total_data = scipy.io.loadmat(self.root + 'A0%dT.mat' % self.nSub)
         self.train_data = self.total_data['data']
+        # Print shape of train data
+        print("Shape of train data: ", self.train_data.shape)
         self.train_label = self.total_data['label']
+        print("Shape of train label: ", self.train_label.shape)
 
-        self.train_data = np.transpose(self.train_data, (2, 1, 0))
+        self.train_data = np.transpose(self.train_data, (2, 0, 1))
         self.train_data = np.expand_dims(self.train_data, axis=1)
         self.train_label = np.transpose(self.train_label)
+        print("Shape of train data after transpose: ", self.train_data.shape)
+        print("Shape of train label after transpose: ", self.train_label.shape)
 
         self.allData = self.train_data
-        self.allLabel = self.train_label[0]
+        self.allLabel = np.array(self.train_label)
+        print("Shape of all data: ", self.allData.shape)
+        print("Shape of all label: ", self.allLabel.shape)
 
         shuffle_num = np.random.permutation(len(self.allData))
         self.allData = self.allData[shuffle_num, :, :, :]
         self.allLabel = self.allLabel[shuffle_num]
 
         # test data
-        self.test_tmp = scipy.io.loadmat(self.root + 'A0%dE.mat' % self.nSub)
         self.test_data = self.test_tmp['data']
         self.test_label = self.test_tmp['label']
 
-        self.test_data = np.transpose(self.test_data, (2, 1, 0))
+        self.test_data = np.transpose(self.test_data, (2, 0, 1))
         self.test_data = np.expand_dims(self.test_data, axis=1)
         self.test_label = np.transpose(self.test_label)
 
         self.testData = self.test_data
-        self.testLabel = self.test_label[0]
+        self.testLabel = np.array(self.test_label)
 
 
         # standardize
@@ -310,6 +343,12 @@ class ExP():
         self.testData = (self.testData - target_mean) / target_std
 
         # data shape: (trial, conv channel, electrode channel, time samples)
+        print("Shape of all data: ", self.allData.shape)
+        print("Shape of all label: ", self.allLabel.shape)
+        print("Shape of test data: ", self.testData.shape)
+        print("Shape of test label: ", self.testLabel.shape)
+        print("all label: ", self.allLabel)
+        print("test label: ", self.testLabel)
         return self.allData, self.allLabel, self.testData, self.testLabel
 
 
@@ -318,21 +357,34 @@ class ExP():
         img, label, test_data, test_label = self.get_source_data()
 
         img = torch.from_numpy(img)
-        label = torch.from_numpy(label - 1)
+        label = torch.from_numpy(label)
 
+        # Print shapes of img and label
+        print("Shape of img: ", img.shape)
+        print("Shape of label: ", label.shape)
+        print("label at start of train", label)
+        
         dataset = torch.utils.data.TensorDataset(img, label)
         self.dataloader = torch.utils.data.DataLoader(dataset=dataset, batch_size=self.batch_size, shuffle=True)
 
+        print("Data loaded")
+
         test_data = torch.from_numpy(test_data)
-        test_label = torch.from_numpy(test_label - 1)
+        test_label = torch.from_numpy(test_label)
         test_dataset = torch.utils.data.TensorDataset(test_data, test_label)
         self.test_dataloader = torch.utils.data.DataLoader(dataset=test_dataset, batch_size=self.batch_size, shuffle=True)
+
+        print("Test data loaded")
 
         # Optimizers
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, betas=(self.b1, self.b2))
 
+        print("Optimizer loaded")
+
         test_data = Variable(test_data.type(self.Tensor))
         test_label = Variable(test_label.type(self.LongTensor))
+
+        print("Test data and label loaded")
 
         bestAcc = 0
         averAcc = 0
@@ -345,12 +397,17 @@ class ExP():
         curr_lr = self.lr
 
         for e in range(self.n_epochs):
+            print("Epoch: ", e)
             # in_epoch = time.time()
             self.model.train()
             for i, (img, label) in enumerate(self.dataloader):
 
-                img = Variable(img.cuda().type(self.Tensor))
-                label = Variable(label.cuda().type(self.LongTensor))
+                print("early label", label)
+
+                img = Variable(img.to(self.device).type(self.Tensor))
+                label = Variable(label.to(self.device).type(self.LongTensor))
+
+                print("label", label)
 
                 # data augmentation
                 aug_data, aug_label = self.interaug(self.allData, self.allLabel)
@@ -360,7 +417,11 @@ class ExP():
 
                 tok, outputs = self.model(img)
 
-                loss = self.criterion_cls(outputs, label) 
+                print("Output shape: ", outputs.shape)
+                print("Label shape: ", label.shape)
+                print(label)
+                loss = self.criterion_cls(outputs, label)
+
 
                 self.optimizer.zero_grad()
                 loss.backward()
