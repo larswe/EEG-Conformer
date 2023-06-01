@@ -215,7 +215,8 @@ class Conformer(nn.Sequential):
 class ExP():
     def __init__(self, nsub, total_data, test_tmp):
         super(ExP, self).__init__()
-        self.batch_size = 16 # 72
+        self.device = torch.device('cpu')
+        self.batch_size = 24 # 72
         self.n_epochs = 2000
         self.c_dim = 2
         self.lr = 0.0002
@@ -230,16 +231,15 @@ class ExP():
         self.log_write = open("./results/log_subject%d.txt" % self.nSub, "w")
 
 
-        self.Tensor = torch.cuda.FloatTensor
-        self.LongTensor = torch.cuda.LongTensor
+        self.Tensor = torch.FloatTensor
+        self.LongTensor = torch.LongTensor
 
-        self.criterion_l1 = torch.nn.L1Loss().cuda()
-        self.criterion_l2 = torch.nn.MSELoss().cuda()
+        self.criterion_l1 = torch.nn.L1Loss().to(self.device)
+        self.criterion_l2 = torch.nn.MSELoss().to(self.device)
         self.criterion_cls = torch.nn.CrossEntropyLoss()
 
-        self.model = Conformer().cuda()
-        self.model = nn.DataParallel(self.model, device_ids=[0])
-        self.model = self.model.cuda()
+        self.model = Conformer().to(self.device)
+        self.model = self.model.to(self.device)
         # summary(self.model, (1, 22, 1000))
 
         self.total_data = total_data
@@ -254,6 +254,8 @@ class ExP():
             cls_idx = np.where(label == cls4aug + 1)
             tmp_data = timg[cls_idx]
             tmp_label = label[cls_idx]
+            print(f"Shape of tmp_data: {tmp_data.shape}")
+            print(f"Shape of tmp_label: {tmp_label.shape}")
 
             tmp_aug_data = np.zeros((int(self.batch_size / 2), 1, 64, 256))
             for ri in range(int(self.batch_size / 2)):
@@ -262,37 +264,61 @@ class ExP():
                         print("tmp_data.shape[0] == 0")
                         break
                     rand_idx = np.random.randint(0, tmp_data.shape[0], 8)
+                    lhs = tmp_aug_data[ri, :, :, rj * 32:(rj + 1) * 32]
+                    rhs = tmp_data[rand_idx[rj], :, :, rj * 32:(rj + 1) * 32]
+                    # print(f"Shape of lhs: {lhs.shape}")
+                    # print(f"Shape of rhs: {rhs.shape}")
                     tmp_aug_data[ri, :, :, rj * 32:(rj + 1) * 32] = tmp_data[rand_idx[rj], :, :,
                                                                     rj * 32:(rj + 1) * 32]
 
             aug_data.append(tmp_aug_data)
             aug_label.append(tmp_label[:int(self.batch_size / 2)])
             appended = tmp_label[:int(self.batch_size / 2)]
-        print("aug_label", aug_label)
+            print("Appended: ", appended)
+            print("Shapes on iteration: ", cls4aug)
+            print(f"Shape of aug_data: {np.array(aug_data).shape}")
+            print(f"Len of aug_label: {np.concatenate(aug_label).shape}")
+        # Print shapes one last time
+        print("Print shapes one last time")
+        print(f"Shape of aug_data: {np.array(aug_data).shape}")
+        print(f"Len of aug_label: {len(aug_label)}")
+        for label in aug_label:
+            print(f"Label: {label}")
+        print(aug_label)
         aug_data = np.concatenate(aug_data)
         aug_label = np.concatenate(aug_label)
         aug_shuffle = np.random.permutation(len(aug_data))
+        print(f"Shape of aug_data: {aug_data.shape}")
+        print(f"Len of aug_label: {len(aug_label)}")
+        print(f"Shape of aug_shuffle: {aug_shuffle.shape}")
         aug_data = aug_data[aug_shuffle, :, :]
         aug_label = aug_label[aug_shuffle]
 
-        aug_data = torch.from_numpy(aug_data).cuda()
+        aug_data = torch.from_numpy(aug_data).to(self.device)
         aug_data = aug_data.float()
-        aug_label = torch.from_numpy(aug_label).cuda()
+        aug_label = torch.from_numpy(aug_label).to(self.device)
         aug_label = aug_label.long()
-
+        print("aug_label: ", aug_label)
         return aug_data, aug_label
 
     def get_source_data(self):
         # train data
         self.train_data = self.total_data['data']
+        # Print shape of train data
+        print("Shape of train data: ", self.train_data.shape)
         self.train_label = self.total_data['label']
+        print("Shape of train label: ", self.train_label.shape)
 
         self.train_data = np.transpose(self.train_data, (2, 0, 1))
         self.train_data = np.expand_dims(self.train_data, axis=1)
         self.train_label = np.transpose(self.train_label)
+        print("Shape of train data after transpose: ", self.train_data.shape)
+        print("Shape of train label after transpose: ", self.train_label.shape)
 
         self.allData = self.train_data
         self.allLabel = np.array(self.train_label)
+        print("Shape of all data: ", self.allData.shape)
+        print("Shape of all label: ", self.allLabel.shape)
 
         shuffle_num = np.random.permutation(len(self.allData))
         self.allData = self.allData[shuffle_num, :, :, :]
@@ -317,14 +343,27 @@ class ExP():
         self.testData = (self.testData - target_mean) / target_std
 
         # data shape: (trial, conv channel, electrode channel, time samples)
+        print("Shape of all data: ", self.allData.shape)
+        print("Shape of all label: ", self.allLabel.shape)
+        print("Shape of test data: ", self.testData.shape)
+        print("Shape of test label: ", self.testLabel.shape)
+        print("all label: ", self.allLabel)
+        print("test label: ", self.testLabel)
         return self.allData, self.allLabel, self.testData, self.testLabel
 
 
     def train(self):
+        with open('/home/s1824086/data/hello.txt', 'w') as f:
+            f.write("Train method called")
         img, label, test_data, test_label = self.get_source_data()
 
         img = torch.from_numpy(img)
         label = torch.from_numpy(label)
+
+        # Print shapes of img and label
+        print("Shape of img: ", img.shape)
+        print("Shape of label: ", label.shape)
+        print("label at start of train", label)
         
         dataset = torch.utils.data.TensorDataset(img, label)
         self.dataloader = torch.utils.data.DataLoader(dataset=dataset, batch_size=self.batch_size, shuffle=True)
@@ -337,9 +376,6 @@ class ExP():
         self.test_dataloader = torch.utils.data.DataLoader(dataset=test_dataset, batch_size=self.batch_size, shuffle=True)
 
         print("Test data loaded")
-        print("Test data shape: ", test_data.shape)
-        print("Test label shape: ", test_label.shape)
-        print("Test label: ", test_label)
 
         # Optimizers
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, betas=(self.b1, self.b2))
@@ -363,16 +399,18 @@ class ExP():
 
         for e in range(self.n_epochs):
             print("Epoch: ", e)
-            # if /home/s1824086/data/hello.txt exists, write to it
-            if os.path.exists('/home/s1824086/data/hello.txt'):
-                with open('/home/s1824086/data/hello.txt', 'w') as f:
-                    f.write("Epoch: " + str(e) + "\n")
+            with open('/home/s1824086/data/hello.txt', 'w') as f:
+                f.write("Epoch: " + str(e) + "\n")
             # in_epoch = time.time()
             self.model.train()
             for i, (img, label) in enumerate(self.dataloader):
 
-                img = Variable(img.cuda().type(self.Tensor))
-                label = Variable(label.cuda().type(self.LongTensor))
+                print("early label", label)
+
+                img = Variable(img.to(self.device).type(self.Tensor))
+                label = Variable(label.to(self.device).type(self.LongTensor))
+
+                print("label", label)
 
                 # data augmentation
                 aug_data, aug_label = self.interaug(self.allData, self.allLabel)
@@ -382,6 +420,9 @@ class ExP():
 
                 tok, outputs = self.model(img)
 
+                print("Output shape: ", outputs.shape)
+                print("Label shape: ", label.shape)
+                print(label)
                 loss = self.criterion_cls(outputs, label)
 
 
