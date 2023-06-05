@@ -55,29 +55,49 @@ import matplotlib.pyplot as plt
 # from torch.utils.tensorboard import SummaryWriter
 
 
-# Convolution module
-# use conv to capture local features, instead of postion embedding.
+# Convolution module.
+# This class extracts local features from EEG signals using convolutional layers
+# and pooling operations.
 class PatchEmbedding(nn.Module):
     def __init__(self, emb_size=40):
         # self.patch_size = patch_size
         super().__init__()
 
+        num_channels = 64
+
+        # Small convolutional neural network
         self.shallownet = nn.Sequential(
+            # Two Conv2d layers to extract local features from EEG signals.
+            # First apply a 1x25 convolution (temporal direction) to each channel of the input.
             nn.Conv2d(1, 40, (1, 25), (1, 1)),
-            nn.Conv2d(40, 40, (22, 1), (1, 1)),
+            # Then apply a 64x1 convolution, combining features from different channels.
+            nn.Conv2d(40, 40, (64, 1), (1, 1)),
+            # BatchNorm2d layer to standardize the outpots of the convolutional layers.
             nn.BatchNorm2d(40),
+            # ELU activation function to introduce non-linearity.
             nn.ELU(),
+            # Average pooling to reduce the dimensionality of the feature maps.
             nn.AvgPool2d((1, 75), (1, 15)),  # pooling acts as slicing to obtain 'patch' along the time dimension as in ViT
+            # Dropout layer to prevent overfitting.
             nn.Dropout(0.5),
         )
 
+        # Linear projection onto lower-dimensional embedding space.
         self.projection = nn.Sequential(
+            # Conv2d layer for linear projection.
             nn.Conv2d(40, emb_size, (1, 1), stride=(1, 1)),  # transpose, conv could enhance fiting ability slightly
+            # Rearrange layer from (batch_size, channels, height, width) to 
+            # (batch_size, height * width, channels) for the multi-head attention layer.
             Rearrange('b e (h) (w) -> b (h w) e'),
         )
 
-
+    # Forward pass of the module.
+    # Expected input shape: (batch_size, channels, height, width).
+    # Width is the temporal dimension, i.e. the number of time steps.
+    # Output: (batch_size, height * width, emb_size) where height * width is the number of patches.
+    # Patches are slices of the input along the time dimension.
     def forward(self, x: Tensor) -> Tensor:
+        print("Shape of input to PatchEmbedding: ", x.shape)
         b, _, _, _ = x.shape
         x = self.shallownet(x)
         x = self.projection(x)
@@ -197,7 +217,7 @@ class ClassificationHead(nn.Module):
             )
             self.fc = self.fc.to(x.device)  # Make sure self.fc is on the right device
             
-        out = self.fc(x)
+        out = self.fc(x.float())
         return x, out
 
 
@@ -215,7 +235,7 @@ class Conformer(nn.Sequential):
 class ExP():
     def __init__(self, nsub, total_data, test_tmp):
         super(ExP, self).__init__()
-        self.batch_size = 16 # 72
+        self.batch_size = 8 # 72
         self.n_epochs = 2000
         self.c_dim = 2
         self.lr = 0.0002
@@ -230,7 +250,8 @@ class ExP():
         self.log_write = open("./results/log_subject%d.txt" % self.nSub, "w")
 
 
-        self.Tensor = torch.cuda.FloatTensor
+        self.Tensor = torch.cuda.HalfTensor
+        # self.Tensor = torch.cuda.FloatTensor
         self.LongTensor = torch.cuda.LongTensor
 
         self.criterion_l1 = torch.nn.L1Loss().cuda()
@@ -238,12 +259,15 @@ class ExP():
         self.criterion_cls = torch.nn.CrossEntropyLoss()
 
         self.model = Conformer().cuda()
-        self.model = nn.DataParallel(self.model, device_ids=[0])
+        self.model = nn.DataParallel(self.model)
         self.model = self.model.cuda()
-        # summary(self.model, (1, 22, 1000))
+        # summary(self.model, (1, 64, 1000))
 
         self.total_data = total_data
         self.test_tmp = test_tmp
+
+        # Use half FP precision in order to save memory
+        # self.model = self.model.half()
 
 
     # Segmentation and Reconstruction (S&R) data augmentation
@@ -268,7 +292,6 @@ class ExP():
             aug_data.append(tmp_aug_data)
             aug_label.append(tmp_label[:int(self.batch_size / 2)])
             appended = tmp_label[:int(self.batch_size / 2)]
-        print("aug_label", aug_label)
         aug_data = np.concatenate(aug_data)
         aug_label = np.concatenate(aug_label)
         aug_shuffle = np.random.permutation(len(aug_data))
@@ -287,6 +310,9 @@ class ExP():
         self.train_data = self.total_data['data']
         self.train_label = self.total_data['label']
 
+        # Reduce FP precision of Tensor to reduce memory consumption
+        self.train_data = self.train_data
+
         self.train_data = np.transpose(self.train_data, (2, 0, 1))
         self.train_data = np.expand_dims(self.train_data, axis=1)
         self.train_label = np.transpose(self.train_label)
@@ -300,6 +326,7 @@ class ExP():
 
         # test data
         self.test_data = self.test_tmp['data']
+        self.test_data = self.test_data
         self.test_label = self.test_tmp['label']
 
         self.test_data = np.transpose(self.test_data, (2, 0, 1))
@@ -331,7 +358,7 @@ class ExP():
 
         print("Data loaded")
 
-        test_data = torch.from_numpy(test_data)
+        test_data = torch.from_numpy(test_data).type(self.Tensor)
         test_label = torch.from_numpy(test_label)
         test_dataset = torch.utils.data.TensorDataset(test_data, test_label)
         self.test_dataloader = torch.utils.data.DataLoader(dataset=test_dataset, batch_size=self.batch_size, shuffle=True)
@@ -362,6 +389,7 @@ class ExP():
         curr_lr = self.lr
 
         for e in range(self.n_epochs):
+            torch.cuda.empty_cache()
             print("Epoch: ", e)
             # if /home/s1824086/data/hello.txt exists, write to it
             if os.path.exists('/home/s1824086/data/hello.txt'):
@@ -369,6 +397,7 @@ class ExP():
                     f.write("Epoch: " + str(e) + "\n")
             # in_epoch = time.time()
             self.model.train()
+            scaler = torch.cuda.amp.GradScaler()
             for i, (img, label) in enumerate(self.dataloader):
 
                 img = Variable(img.cuda().type(self.Tensor))
@@ -376,34 +405,51 @@ class ExP():
 
                 # data augmentation
                 aug_data, aug_label = self.interaug(self.allData, self.allLabel)
-                img = torch.cat((img, aug_data))
-                label = torch.cat((label, aug_label))
+                # print("aug_data", aug_data)
+                img_combined = torch.cat((img, aug_data)).type(self.Tensor)
+                label_combined = torch.cat((label, aug_label))
 
+                del img, label, aug_data, aug_label
 
-                tok, outputs = self.model(img)
-
-                loss = self.criterion_cls(outputs, label)
-
+                # forward pass
+                with torch.cuda.amp.autocast():
+                    tok, outputs = self.model(img_combined)
+                    loss = self.criterion_cls(outputs, label_combined)
+                    # print("Outputs: ", outputs)
+                    # print("Label: ", label)
+                    # print("Loss: ", loss)
 
                 self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
+
+                # During this step, values become nan using FP16...
+                # loss.backward()
+                # Instead try backward pass with scale
+                scaler.scale(loss).backward()
+
+                # optimizer step
+                scaler.step(self.optimizer)
+
+                scaler.update()
+
+                # Delete tensors that are no longer needed
+                del img_combined, tok
 
 
             # out_epoch = time.time()
 
-
+            print("Now testing...")
+            torch.cuda.empty_cache()
             # test process
             if (e + 1) % 1 == 0:
                 self.model.eval()
-                Tok, Cls = self.model(test_data)
-
+                with torch.cuda.amp.autocast():
+                    Tok, Cls = self.model(test_data)
 
                 loss_test = self.criterion_cls(Cls, test_label)
                 y_pred = torch.max(Cls, 1)[1]
                 acc = float((y_pred == test_label).cpu().numpy().astype(int).sum()) / float(test_label.size(0))
                 train_pred = torch.max(outputs, 1)[1]
-                train_acc = float((train_pred == label).cpu().numpy().astype(int).sum()) / float(label.size(0))
+                train_acc = float((train_pred == label_combined).cpu().numpy().astype(int).sum()) / float(label_combined.size(0))
 
                 print('Epoch:', e,
                       '  Train loss: %.6f' % loss.detach().cpu().numpy(),
