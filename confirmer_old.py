@@ -9,10 +9,6 @@ Couple CNN and Transformer in a concise manner with amazing results
 
 import argparse
 import os
-# gpus = os.environ['CUDA_VISIBLE_DEVICES'].split(',')
-gpus = [0]
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
 import numpy as np
 import math
 import glob
@@ -57,41 +53,51 @@ from einops.layers.torch import Rearrange, Reduce
 
 import matplotlib.pyplot as plt
 # from torch.utils.tensorboard import SummaryWriter
-from torch.backends import cudnn
-cudnn.benchmark = False
-cudnn.deterministic = True
-
-# writer = SummaryWriter('./TensorBoardX/')
 
 
-# Convolution module
-# use conv to capture local features, instead of postion embedding.
+# Convolution module.
+# This class extracts local features from EEG signals using convolutional layers
+# and pooling operations.
 class PatchEmbedding(nn.Module):
     def __init__(self, emb_size=40):
         # self.patch_size = patch_size
         super().__init__()
 
-        self.num_channels = 64
-        self.k = 40
+        num_channels = 64
 
+        # Small convolutional neural network
         self.shallownet = nn.Sequential(
-            nn.Conv2d(1, self.k, (1, 25), (1, 1)), # Temporal Convolution
-            nn.Conv2d(self.k, self.k, (self.num_channels, 1), (1, 1)), # Spatial Convolution
-            nn.BatchNorm2d(self.k), # Batch Normalization
-            nn.ELU(), # Activation Function
-            nn.AvgPool2d((1, 75), (1, 15)),  # Pooling
-            nn.Dropout(0.5), # Dropout
+            # Two Conv2d layers to extract local features from EEG signals.
+            # First apply a 1x25 convolution (temporal direction) to each channel of the input.
+            nn.Conv2d(1, 40, (1, 25), (1, 1)),
+            # Then apply a 64x1 convolution, combining features from different channels.
+            nn.Conv2d(40, 40, (64, 1), (1, 1)),
+            # BatchNorm2d layer to standardize the outpots of the convolutional layers.
+            nn.BatchNorm2d(40),
+            # ELU activation function to introduce non-linearity.
+            nn.ELU(),
+            # Average pooling to reduce the dimensionality of the feature maps.
+            nn.AvgPool2d((1, 75), (1, 15)),  # pooling acts as slicing to obtain 'patch' along the time dimension as in ViT
+            # Dropout layer to prevent overfitting.
+            nn.Dropout(0.5),
         )
 
+        # Linear projection onto lower-dimensional embedding space.
         self.projection = nn.Sequential(
-            nn.Conv2d(self.k, emb_size, (1, 1), stride=(1, 1)),  # transpose, conv could enhance fiting ability slightly
+            # Conv2d layer for linear projection.
+            nn.Conv2d(40, emb_size, (1, 1), stride=(1, 1)),  # transpose, conv could enhance fiting ability slightly
             # Rearrange layer from (batch_size, channels, height, width) to 
             # (batch_size, height * width, channels) for the multi-head attention layer.
             Rearrange('b e (h) (w) -> b (h w) e'),
         )
 
-
+    # Forward pass of the module.
+    # Expected input shape: (batch_size, channels, height, width).
+    # Width is the temporal dimension, i.e. the number of time steps.
+    # Output: (batch_size, height * width, emb_size) where height * width is the number of patches.
+    # Patches are slices of the input along the time dimension.
     def forward(self, x: Tensor) -> Tensor:
+        print("Shape of input to PatchEmbedding: ", x.shape)
         b, _, _, _ = x.shape
         x = self.shallownet(x)
         x = self.projection(x)
@@ -181,30 +187,39 @@ class TransformerEncoder(nn.Sequential):
         super().__init__(*[TransformerEncoderBlock(emb_size) for _ in range(depth)])
 
 
-class ClassificationHead(nn.Sequential):
+class ClassificationHead(nn.Module):
     def __init__(self, emb_size, n_classes):
         super().__init__()
         
-        # global average pooling
         self.clshead = nn.Sequential(
             Reduce('b n e -> b e', reduction='mean'),
             nn.LayerNorm(emb_size),
             nn.Linear(emb_size, n_classes)
         )
-        self.fc = nn.Sequential(
-            nn.Linear(440, 256), # Was 2440 but dimensions didn't match. TODO: Figure out what this number is.
-            nn.ELU(),
-            nn.Dropout(0.5),
-            nn.Linear(256, 32),
-            nn.ELU(),
-            nn.Dropout(0.3),
-            nn.Linear(32, 4)
-        )
+        
+        # The dimensions of the linear layers in this sequence will be determined later
+        self.fc = None 
 
     def forward(self, x):
         x = x.contiguous().view(x.size(0), -1)
-        out = self.fc(x)
+        
+        # If self.fc has not been defined yet, or if the input size has changed,
+        # define it now with the correct input size
+        if self.fc is None or self.fc[0].in_features != x.size(-1):
+            self.fc = nn.Sequential(
+                nn.Linear(x.size(-1), 256),
+                nn.ELU(),
+                nn.Dropout(0.5),
+                nn.Linear(256, 32),
+                nn.ELU(),
+                nn.Dropout(0.3),
+                nn.Linear(32, 2)
+            )
+            self.fc = self.fc.to(x.device)  # Make sure self.fc is on the right device
+            
+        out = self.fc(x.float())
         return x, out
+
 
 
 class Conformer(nn.Sequential):
@@ -218,83 +233,92 @@ class Conformer(nn.Sequential):
 
 
 class ExP():
-    def __init__(self, nsub, total_data, test_tmp, model_name='model.tph'):
+    def __init__(self, nsub, total_data, test_tmp):
         super(ExP, self).__init__()
-        self.batch_size = 72
-        self.n_epochs = 10
-        self.c_dim = 4
+        self.batch_size = 8 # 72
+        self.n_epochs = 2000
+        self.c_dim = 2
         self.lr = 0.0002
         self.b1 = 0.5
         self.b2 = 0.999
         self.dimension = (190, 50)
         self.nSub = nsub
-        self.n_classes = 2
 
         self.start_epoch = 0
         self.root = '../data/'
 
         self.log_write = open("./results/log_subject%d.txt" % self.nSub, "w")
 
-        self.total_data = total_data
-        self.test_tmp = test_tmp
-        self.model_name = model_name
 
-        self.Tensor = torch.cuda.FloatTensor
+        self.Tensor = torch.cuda.HalfTensor
+        # self.Tensor = torch.cuda.FloatTensor
         self.LongTensor = torch.cuda.LongTensor
 
         self.criterion_l1 = torch.nn.L1Loss().cuda()
         self.criterion_l2 = torch.nn.MSELoss().cuda()
-        self.criterion_cls = torch.nn.CrossEntropyLoss().cuda()
+        self.criterion_cls = torch.nn.CrossEntropyLoss()
 
-        self.model = Conformer(n_classes=self.n_classes).cuda()
-        self.model = nn.DataParallel(self.model, device_ids=[i for i in range(len(gpus))])
+        self.model = Conformer().cuda()
+        self.model = nn.DataParallel(self.model)
         self.model = self.model.cuda()
-        # summary(self.model, (1, 22, 1000))
+        # summary(self.model, (1, 64, 1000))
+
+        self.total_data = total_data
+        self.test_tmp = test_tmp
+
+        # Use half FP precision in order to save memory
+        # self.model = self.model.half()
 
 
     # Segmentation and Reconstruction (S&R) data augmentation
     def interaug(self, timg, label):  
         aug_data = []
         aug_label = []
-        num_channels = 64
-        for cls4aug in range(self.n_classes):
+        for cls4aug in range(-1, 1):
             cls_idx = np.where(label == cls4aug + 1)
             tmp_data = timg[cls_idx]
             tmp_label = label[cls_idx]
 
-            tmp_aug_data = np.zeros((int(self.batch_size / self.n_classes), 1, num_channels, 256))
-            for ri in range(int(self.batch_size / self.n_classes)):
+            tmp_aug_data = np.zeros((int(self.batch_size / 2), 1, 64, 256))
+            for ri in range(int(self.batch_size / 2)):
                 for rj in range(8):
+                    if (tmp_data.shape[0] == 0):
+                        print("tmp_data.shape[0] == 0")
+                        break
                     rand_idx = np.random.randint(0, tmp_data.shape[0], 8)
-                    tmp_aug_data[ri, :, :, rj * 32:(rj + 1) * 32] = tmp_data[rand_idx[rj], :, :, rj * 32:(rj + 1) * 32]
+                    tmp_aug_data[ri, :, :, rj * 32:(rj + 1) * 32] = tmp_data[rand_idx[rj], :, :,
+                                                                    rj * 32:(rj + 1) * 32]
 
             aug_data.append(tmp_aug_data)
-            aug_label.append(tmp_label[:int(self.batch_size / self.n_classes)])
+            aug_label.append(tmp_label[:int(self.batch_size / 2)])
+            appended = tmp_label[:int(self.batch_size / 2)]
         aug_data = np.concatenate(aug_data)
         aug_label = np.concatenate(aug_label)
-        
         aug_shuffle = np.random.permutation(len(aug_data))
         aug_data = aug_data[aug_shuffle, :, :]
         aug_label = aug_label[aug_shuffle]
 
         aug_data = torch.from_numpy(aug_data).cuda()
         aug_data = aug_data.float()
-        aug_label = torch.from_numpy(aug_label-1).cuda()
+        aug_label = torch.from_numpy(aug_label).cuda()
         aug_label = aug_label.long()
+
         return aug_data, aug_label
 
     def get_source_data(self):
-
         # train data
         self.train_data = self.total_data['data']
         self.train_label = self.total_data['label']
+
+        # Reduce FP precision of Tensor to reduce memory consumption
+        self.train_data = self.train_data
 
         self.train_data = np.transpose(self.train_data, (2, 0, 1))
         self.train_data = np.expand_dims(self.train_data, axis=1)
         self.train_label = np.transpose(self.train_label)
 
         self.allData = self.train_data
-        self.allLabel = self.train_label.detach().cpu().numpy()
+        self.allLabel = np.array(self.train_label)
 
         shuffle_num = np.random.permutation(len(self.allData))
         self.allData = self.allData[shuffle_num, :, :, :]
@@ -302,6 +326,7 @@ class ExP():
 
         # test data
         self.test_data = self.test_tmp['data']
+        self.test_data = self.test_data
         self.test_label = self.test_tmp['label']
 
         self.test_data = np.transpose(self.test_data, (2, 0, 1))
@@ -309,7 +334,7 @@ class ExP():
         self.test_label = np.transpose(self.test_label)
 
         self.testData = self.test_data
-        self.testLabel = self.test_label.detach().cpu().numpy()
+        self.testLabel = np.array(self.test_label)
 
 
         # standardize
@@ -323,25 +348,35 @@ class ExP():
 
 
     def train(self):
-
         img, label, test_data, test_label = self.get_source_data()
 
         img = torch.from_numpy(img)
-        label = torch.from_numpy(label - 1)
-
+        label = torch.from_numpy(label)
+        
         dataset = torch.utils.data.TensorDataset(img, label)
         self.dataloader = torch.utils.data.DataLoader(dataset=dataset, batch_size=self.batch_size, shuffle=True)
 
-        test_data = torch.from_numpy(test_data)
-        test_label = torch.from_numpy(test_label - 1)
+        print("Data loaded")
+
+        test_data = torch.from_numpy(test_data).type(self.Tensor)
+        test_label = torch.from_numpy(test_label)
         test_dataset = torch.utils.data.TensorDataset(test_data, test_label)
         self.test_dataloader = torch.utils.data.DataLoader(dataset=test_dataset, batch_size=self.batch_size, shuffle=True)
+
+        print("Test data loaded")
+        print("Test data shape: ", test_data.shape)
+        print("Test label shape: ", test_label.shape)
+        print("Test label: ", test_label)
 
         # Optimizers
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, betas=(self.b1, self.b2))
 
+        print("Optimizer loaded")
+
         test_data = Variable(test_data.type(self.Tensor))
         test_label = Variable(test_label.type(self.LongTensor))
+
+        print("Test data and label loaded")
 
         bestAcc = 0
         averAcc = 0
@@ -354,8 +389,15 @@ class ExP():
         curr_lr = self.lr
 
         for e in range(self.n_epochs):
+            torch.cuda.empty_cache()
+            print("Epoch: ", e)
+            # if /home/s1824086/data/hello.txt exists, write to it
+            if os.path.exists('/home/s1824086/data/hello.txt'):
+                with open('/home/s1824086/data/hello.txt', 'w') as f:
+                    f.write("Epoch: " + str(e) + "\n")
             # in_epoch = time.time()
             self.model.train()
+            scaler = torch.cuda.amp.GradScaler()
             for i, (img, label) in enumerate(self.dataloader):
 
                 img = Variable(img.cuda().type(self.Tensor))
@@ -363,33 +405,51 @@ class ExP():
 
                 # data augmentation
                 aug_data, aug_label = self.interaug(self.allData, self.allLabel)
-                img = torch.cat((img, aug_data))
-                label = torch.cat((label, aug_label))
+                # print("aug_data", aug_data)
+                img_combined = torch.cat((img, aug_data)).type(self.Tensor)
+                label_combined = torch.cat((label, aug_label))
 
+                del img, label, aug_data, aug_label
 
-                tok, outputs = self.model(img)
-
-                loss = self.criterion_cls(outputs, label) 
+                # forward pass
+                with torch.cuda.amp.autocast():
+                    tok, outputs = self.model(img_combined)
+                    loss = self.criterion_cls(outputs, label_combined)
+                    # print("Outputs: ", outputs)
+                    # print("Label: ", label)
+                    # print("Loss: ", loss)
 
                 self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
+
+                # During this step, values become nan using FP16...
+                # loss.backward()
+                # Instead try backward pass with scale
+                scaler.scale(loss).backward()
+
+                # optimizer step
+                scaler.step(self.optimizer)
+
+                scaler.update()
+
+                # Delete tensors that are no longer needed
+                del img_combined, tok
 
 
             # out_epoch = time.time()
 
-
+            print("Now testing...")
+            torch.cuda.empty_cache()
             # test process
             if (e + 1) % 1 == 0:
                 self.model.eval()
-                Tok, Cls = self.model(test_data)
-
+                with torch.cuda.amp.autocast():
+                    Tok, Cls = self.model(test_data)
 
                 loss_test = self.criterion_cls(Cls, test_label)
                 y_pred = torch.max(Cls, 1)[1]
                 acc = float((y_pred == test_label).cpu().numpy().astype(int).sum()) / float(test_label.size(0))
                 train_pred = torch.max(outputs, 1)[1]
-                train_acc = float((train_pred == label).cpu().numpy().astype(int).sum()) / float(label.size(0))
+                train_acc = float((train_pred == label_combined).cpu().numpy().astype(int).sum()) / float(label_combined.size(0))
 
                 print('Epoch:', e,
                       '  Train loss: %.6f' % loss.detach().cpu().numpy(),
@@ -406,7 +466,7 @@ class ExP():
                     Y_pred = y_pred
 
 
-        torch.save(self.model.module.state_dict(), self.model_name)
+        torch.save(self.model.module.state_dict(), 'model.pth')
         averAcc = averAcc / num
         print('The average accuracy is:', averAcc)
         print('The best accuracy is:', bestAcc)
